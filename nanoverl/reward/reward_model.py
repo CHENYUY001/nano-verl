@@ -19,6 +19,7 @@ class NanoRewardModel:
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
+            num_labels=1,
             trust_remote_code=True,
             device_map="cpu" 
         )
@@ -27,7 +28,14 @@ class NanoRewardModel:
         # 2. processing tokenizer (optional)
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            
+            # ========== test gpt2 Start ==========
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.model.config.pad_token_id = self.tokenizer.eos_token_id
+            # =============== End =================
         except:
+            print(f"[NanoRewardModel] Warning: Tokenizer could not be loaded. {e}")
             self.tokenizer = None
 
     def _load_to_device(self):
@@ -78,10 +86,10 @@ class NanoRewardModel:
         except Exception as e:
             print(f"[NanoRewardModel] Error during computation: {e}")
             rewards = torch.zeros(input_ids.size(0), device=self.device)
-        
+        # 4. memory optimization
         self._offload_to_cpu()
         
-        return rewards
+        return rewards.cpu()
 
     @torch.no_grad()
     def compute_reward_with_text(self, prompts, responses):
