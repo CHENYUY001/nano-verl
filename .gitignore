@@ -1,5 +1,5 @@
 # test file
-nanoverl/test/test_reward.py
+/nanoverl/test/test_reward.py
 # Python
 __pycache__/
 *.py[cod]
