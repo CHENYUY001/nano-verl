@@ -13,17 +13,13 @@ class SGLangRolloutWorker(RolloutWorker):
         super().__init__(config)
         
         # 1. 初始化 SGLang 推理引擎
-        # model_path 可以是本地路径或 HuggingFace ID
         self.engine = Engine(
             model_path=config.model_path,
             tp_size=1,                    # 单卡推理
-            mem_fraction_static=0.8,      # 显存占比，留一部分给训练
+            mem_fraction_static=0.2,      # 显存占比
             trust_remote_code=True
         )
-        
-        # 2. 获取 tokenizer 的 pad_token_id 用于后续 padding
-        self.pad_token_id = self.engine.tokenizer.pad_token_id or 0
-        
+
         # 3. 配置采样参数（sglang 接受 dict 格式）
         self.sampling_params = {
             "temperature": getattr(config, "temperature", 1.0),
@@ -31,64 +27,83 @@ class SGLangRolloutWorker(RolloutWorker):
             "max_new_tokens": getattr(config, "max_new_tokens", 1024),
         }
 
+
     def generate(self, batches):
-        """
-        输入 batches 包含 'input_ids' [B, L_p]
-        返回要求的 tensor 字典
-        """
-        # 将 torch tensor 转为 list[list[int]] 给 sglang
-        input_ids_list = batches["input_ids"].tolist()
-        
-        # 调用 sglang 引擎进行推理
-        # sglang 内部会自动处理 batching
+        input_ids = batches["input_ids"]
+        # 上游保证提供 prompt attention_mask（与 input_ids 对齐）
+        prompt_attention_mask = batches["attention_mask"]
+        # 约定：上游已保证都是 torch.Tensor 且已在正确 device 上
+        assert isinstance(input_ids, torch.Tensor)
+        assert isinstance(prompt_attention_mask, torch.Tensor)
+
+        # 2. 推理: 调用 sglang
+        # 注意：sglang Engine.generate 这里需要 python 的 list[list[int]] 作为 batch 输入
+        input_ids_list = input_ids.tolist()
         outputs = self.engine.generate(
             input_ids=input_ids_list,
             sampling_params=self.sampling_params,
             return_logprob=True
         )
 
-        all_prompts = batches["input_ids"]
-        all_responses = []
-        all_logprobs = []
-        all_tokens = []
-
-        for i, output in enumerate(outputs):
-            # 获取生成的 token IDs 和对应的 logprobs
-            # output.meta_info['output_token_logprobs'] 格式为: [[logprob, id], ...]
-            resp_tokens = [item[1] for item in output.meta_info["output_token_logprobs"]]
-            resp_logprobs = [item[0] for item in output.meta_info["output_token_logprobs"]]
-            
-            # 转换为 tensor
-            resp_tensor = torch.tensor(resp_tokens)
-            logprob_tensor = torch.tensor(resp_logprobs)
-            
-            all_responses.append(resp_tensor)
-            all_logprobs.append(logprob_tensor)
-            
-            # 拼接 prompt 和 response
-            all_tokens.append(torch.cat([all_prompts[i], resp_tensor]))
-
-        # 使用 pad_sequence 处理变长输出
-        responses = pad_sequence(all_responses, batch_first=True, padding_value=self.pad_token_id)
-        logprobs = pad_sequence(all_logprobs, batch_first=True, padding_value=0.0)
-        tokens = pad_sequence(all_tokens, batch_first=True, padding_value=self.pad_token_id)
+        # 3. 解析输出: outputs 是 List[dict]，每条 dict 至少包含:
+        # - "output_ids": response token ids (list[int])
+        # - "meta_info"["output_token_logprobs"]: [(logprob, token_id, token_text_or_None), ...]
+        response_list = []
+        logprob_list = []
+        for output in outputs:
+            response_list.append(output["output_ids"])
+            logprob_list.append(output["meta_info"]["output_token_logprobs"])
         
-        # 计算 Mask
-        attention_mask = (tokens != self.pad_token_id).long()
-        
-        # loss_mask: response 部分为 1，prompt 部分为 0
-        loss_mask = torch.zeros_like(tokens)
-        for i, resp in enumerate(all_responses):
-            prompt_len = all_prompts[i].size(0)
-            loss_mask[i, prompt_len : prompt_len + len(resp)] = 1
+        # 4. ragged -> padded tensors
+        # - responses: List[List[int]] -> LongTensor [B, Lr]
+        # - logprobs:  List[List[tuple]] -> FloatTensor [B, Lr]
+        device = input_ids.device
+
+        response_tensors = [
+            torch.tensor(r, dtype=torch.long, device=device) for r in response_list
+        ]
+        resp_lens = torch.tensor([t.numel() for t in response_tensors], dtype=torch.long, device=device)
+        max_lr = int(resp_lens.max().item()) if resp_lens.numel() > 0 else 0
+
+        if max_lr == 0:
+            # 全部没有生成 token 的极端情况
+            responses = torch.empty((len(response_tensors), 0), dtype=torch.long, device=device)
+            logprobs = torch.empty((len(response_tensors), 0), dtype=torch.float32, device=device)
+            response_attention_mask = torch.empty((len(response_tensors), 0), dtype=torch.long, device=device)
+        else:
+            # responses padding（pad id 对 response 本身意义不大，反正会配合 mask）
+            responses = pad_sequence(response_tensors, batch_first=True, padding_value=0)
+            # response attention mask: 1 for valid response tokens, 0 for padding
+            arange_lr = torch.arange(max_lr, device=device).unsqueeze(0)  # [1, Lr]
+            response_attention_mask = (arange_lr < resp_lens.unsqueeze(1)).to(dtype=torch.long)
+
+            # logprobs: 取 meta_info 的第 0 个字段 (logprob)，并 pad 到 max_lr
+            logprob_tensors = []
+            for lp in logprob_list:
+                # lp: [(logprob, token_id, token_text_or_None), ...]
+                vals = [float(x[0]) for x in lp]
+                logprob_tensors.append(torch.tensor(vals, dtype=torch.float32, device=device))
+            logprobs = pad_sequence(logprob_tensors, batch_first=True, padding_value=0.0)
+
+        # 5. tokens / attention_mask / loss_mask
+        # prompts: 期望为 [B, Lp]（已经是 padding 后的 prompt）
+        prompts = input_ids
+        prompt_attention_mask = prompt_attention_mask.to(dtype=torch.long, device=device)
+
+        # 拼接得到全序列 tokens（prompt padding + response padding）
+        tokens = torch.cat([prompts, responses], dim=1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
+
+        # loss_mask: 只对 response 的有效 token 计算 loss / reward，prompt 和 padding 都是 0
+        loss_mask = torch.cat([torch.zeros_like(prompt_attention_mask), response_attention_mask], dim=1)
 
         return {
-            'prompts': all_prompts,
-            'responses': responses,
-            'tokens': tokens,
-            'logprobs': logprobs,
-            'attention_mask': attention_mask,
-            'loss_mask': loss_mask
+            "prompts": prompts,
+            "responses": responses,
+            "tokens": tokens,
+            "logprobs": logprobs,
+            "attention_mask": attention_mask,
+            "loss_mask": loss_mask,
         }
 
     def sync_actor_to_rollout(self, actor_model=None):
@@ -97,12 +112,9 @@ class SGLangRolloutWorker(RolloutWorker):
         """
         if actor_model is None:
             return
-            
-        # sglang 提供了直接更新权重的 API
-        # 接收一个 dict: {name: tensor}
-        # 注意：tensor 必须在显存中且与推理卡对应
+
+
         state_dict = actor_model.state_dict()
         
-        # 这里的 key 映射需要根据模型实现微调，sglang 默认支持大部分 HF 格式
         self.engine.update_weights(state_dict)
         logger.info("Rollout weights synchronized via sglang.update_weights")

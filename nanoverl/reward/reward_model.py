@@ -16,27 +16,25 @@ class NanoRewardModel:
         print(f"[NanoRewardModel] Loading Reward Model from {model_path}...")
         #load model
         #offload model to CPU
+        
+        # 1. load Tokenizer to identify pad_token
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token_id is None:
+            # use eos_token as pad_token
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        # 2. transfer pad_token_id
         self.model = AutoModelForSequenceClassification.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             num_labels=1,
             trust_remote_code=True,
-            device_map="cpu" 
+            device_map="cpu",
+            pad_token_id=self.tokenizer.pad_token_id 
         )
-        self.model.eval()
         
-        # 2. processing tokenizer (optional)
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            
-            # ========== test gpt2 Start ==========
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.model.config.pad_token_id = self.tokenizer.eos_token_id
-            # =============== End =================
-        except:
-            print(f"[NanoRewardModel] Warning: Tokenizer could not be loaded. {e}")
-            self.tokenizer = None
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        self.model.eval()
 
     def _load_to_device(self):
         """load to GPU"""
